@@ -1,0 +1,81 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function familyPath(fid) { return /databases/$(database)/documents/families/$(fid); }
+    function memberPath(fid, uid) { return /databases/$(database)/documents/families/$(fid)/members/$(uid); }
+    function isMember(fid) { return signedIn() && exists(memberPath(fid, request.auth.uid)); }
+    function isAdmin(fid) { return isMember(fid) && get(memberPath(fid, request.auth.uid)).data.role == 'admin'; }
+    function validItem(d) {
+      return d.keys().hasAll(['type','scope','ownerUid','createdAt'])
+        && d.keys().hasOnly(['type','scope','ownerUid','createdAt','updatedAt','title','date','time','description','category','repeat','done'])
+        && d.type in ['event','note','shopping']
+        && d.scope in ['family','private']
+        && d.ownerUid is string
+        && d.ownerUid.size() > 0
+        && d.title is string && d.title.size() <= 500
+        && (!('description' in d) || (d.description is string && d.description.size() <= 30000))
+        && (!('date' in d) || (d.date is string && d.date.size() <= 10))
+        && (!('time' in d) || (d.time is string && d.time.size() <= 5))
+        && (!('category' in d) || (d.category is string && d.category.size() <= 100))
+        && (!('repeat' in d) || d.repeat in ['none','daily','weekly','monthly','yearly'])
+        && (!('done' in d) || d.done is bool);
+    }
+    match /profiles/{uid} {
+      allow read, create, update, delete: if signedIn() && request.auth.uid == uid
+        && (request.method == 'delete' || (request.resource.data.keys().hasOnly(['familyId','theme','displayName'])
+        && request.resource.data.familyId is string && request.resource.data.familyId.size() <= 120
+        && request.resource.data.theme in ['whale','iron','spider','hulk','space']
+        && request.resource.data.displayName is string && request.resource.data.displayName.size() <= 80));
+    }
+    match /families/{fid} {
+      allow read: if isMember(fid);
+      allow create: if signedIn() && request.resource.data.keys().hasOnly(['name','ownerUid','createdAt'])
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.name is string && request.resource.data.name.size() <= 100;
+      allow update, delete: if isAdmin(fid);
+      match /members/{uid} {
+        allow read: if isMember(fid) || (signedIn() && request.auth.uid == uid);
+        allow create: if signedIn() && (
+          (request.auth.uid == uid && request.resource.data.role == 'admin'
+           && get(familyPath(fid)).data.ownerUid == uid)
+          || (isAdmin(fid) && request.resource.data.role == 'member')
+          || (request.auth.uid == uid && request.resource.data.role == 'member'
+              && request.resource.data.keys().hasAll(['tokenId'])
+              && exists(/databases/$(database)/documents/joinTokens/$(request.resource.data.tokenId))
+              && get(/databases/$(database)/documents/joinTokens/$(request.resource.data.tokenId)).data.familyId == fid
+              && get(/databases/$(database)/documents/joinTokens/$(request.resource.data.tokenId)).data.email == request.auth.token.email
+              && get(/databases/$(database)/documents/joinTokens/$(request.resource.data.tokenId)).data.expiresAt > request.time)
+        ) && request.resource.data.keys().hasOnly(['role','displayName','joinedAt','tokenId'])
+          && request.resource.data.displayName is string && request.resource.data.displayName.size() <= 80;
+        allow update: if isAdmin(fid) && uid != get(familyPath(fid)).data.ownerUid;
+        allow delete: if isAdmin(fid) && uid != get(familyPath(fid)).data.ownerUid;
+      }
+      match /invites/{inviteId} {
+        allow read, write: if isAdmin(fid);
+      }
+      match /items/{itemId} {
+        allow read: if isMember(fid) && (resource.data.scope == 'family' || resource.data.ownerUid == request.auth.uid);
+        allow create: if isMember(fid) && validItem(request.resource.data)
+          && request.resource.data.ownerUid == request.auth.uid;
+        allow update: if isMember(fid) && validItem(request.resource.data)
+          && (resource.data.scope == 'family' || resource.data.ownerUid == request.auth.uid)
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          && request.resource.data.type == resource.data.type;
+        allow delete: if isMember(fid) && (resource.data.scope == 'family' || resource.data.ownerUid == request.auth.uid);
+      }
+    }
+    // Pozvánky: správce vytvoří dokument s náhodným ID. Nový uživatel ho smí
+    // přečíst pouze při znalosti celého ID; pravidla vynucují jeho e-mail a platnost.
+    match /joinTokens/{token} {
+      allow read: if signedIn() && resource.data.email == request.auth.token.email
+        && resource.data.expiresAt > request.time;
+      allow create: if signedIn() && isAdmin(request.resource.data.familyId)
+        && request.resource.data.keys().hasOnly(['familyId','email','expiresAt','createdBy'])
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.email is string;
+      allow delete: if signedIn() && (isAdmin(resource.data.familyId) || resource.data.email == request.auth.token.email);
+      allow update: if false;
+    }
+  }
+}
